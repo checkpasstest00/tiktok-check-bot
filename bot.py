@@ -398,6 +398,7 @@ def main():
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     _start_health_server()
+    log.info("bot version: v2-direct (doc truc tiep tiktok.com, khong dung tikwm)")
     log.info("Bot đang chạy, chờ tin nhắn...")
     app.run_polling()
 
