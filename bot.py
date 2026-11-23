@@ -38,6 +38,13 @@ log = logging.getLogger("tiktok-checker")
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 GROUP_URL = os.environ.get("GROUP_URL", "https://t.me/").strip()
+# --- watchlist (theo dõi LIVE/DIE) ---
+WATCH_FILE = os.environ.get(
+    "WATCHLIST_FILE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "watchlist.json"),
+)
+WATCH_INTERVAL_SEC = max(60, int(os.environ.get("WATCH_INTERVAL_MIN", "30")) * 60)
+WATCH_GAP_SEC = 3  # giãn cách giữa 2 lần check trong 1 lượt quét watchlist
 VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -301,8 +308,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 Chào sếp! Gửi cho tôi <b>username</b> hoặc <b>link TikTok</b> "
         "(vd: @phucduynguyen497 hoặc https://www.tiktok.com/@phucduynguyen497) "
         "để check thông tin kênh.\n\nLệnh:\n"
-        "/check &lt;username&gt; — xem báo cáo chi tiết\n"
-        "/livedie &lt;user1&gt; &lt;user2&gt;... — check acc LIVE hay DIE (tối đa 20 acc/lần)",
+        "/check &lt;username&gt; — xem báo cáo chi tiết (LIVE thì ra đủ thông tin, DIE thì báo DIE)\n"
+        "/livedie &lt;user1&gt; &lt;user2&gt;... — check acc LIVE hay DIE (tối đa 20 acc/lần)\n"
+        "/checklive &lt;user&gt; — check LIVE/DIE ngay (LIVE ra đủ thông tin) + tự theo dõi, đổi trạng thái là báo\n"
+        "/watch &lt;user1&gt; &lt;user2&gt;... — theo dõi acc, đổi trạng thái LIVE/DIE là bot báo ngay\n"
+        "/unwatch &lt;user1&gt;... — bỏ theo dõi\n"
+        "/watchlist — xem danh sách đang theo dõi",
         parse_mode=ParseMode.HTML,
     )
 
@@ -313,11 +324,18 @@ async def do_check(message, username: str):
         user = await fetch_tiktok_user(username)
     except Exception as e:
         log.warning("fetch failed for %s: %s", username, e)
-        await message.reply_text(
-            f"⚠️ Không check được @{html.escape(username)} lúc này "
-            "(kênh không tồn tại / riêng tư / API bận). Thử lại sau nhé sếp.",
-            parse_mode=ParseMode.HTML,
-        )
+        if _is_not_found_error(e):
+            await message.reply_text(
+                f"❌ <b>DIE</b> — @{html.escape(username)} không tồn tại "
+                "(đã bị khóa / đã xóa / sai username), không có thông tin kênh.",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await message.reply_text(
+                f"⚠️ Không check được @{html.escape(username)} lúc này "
+                "(lỗi tạm thời / API bận). Thử lại sau nhé sếp.",
+                parse_mode=ParseMode.HTML,
+            )
         return
     text, kb = build_report(username, user)
     await message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
@@ -349,19 +367,274 @@ def parse_usernames(text: str, limit: int = 20) -> list:
     return found
 
 
+def _is_not_found_error(e: Exception) -> bool:
+    """Lỗi này có nghĩa TikTok xác nhận tài khoản KHÔNG tồn tại (DIE),
+    phân biệt với lỗi tạm thời (rate limit, lỗi mạng, TikTok đổi cấu trúc trang)."""
+    msg = str(e).lower()
+    return "user not found" in msg or "http 404" in msg
+
+
 async def probe_live(username: str) -> tuple:
-    """Trả về (is_live, is_private, nickname). Thử lại 1 lần nếu lỗi mạng."""
-    user = None
+    """Trả về (status, is_private, nickname) với status là 'live' | 'die' | 'unknown'.
+    - live: lấy được dữ liệu profile.
+    - die: TikTok báo không tìm thấy tài khoản (404 / user not found).
+    - unknown: lỗi tạm thời (rate limit, mạng, cấu trúc trang) — chưa chắc chắn.
+    Thử lại 1 lần nếu lỗi tạm thời."""
+    last_err = None
     for _ in range(2):
         try:
             user = await fetch_tiktok_user(username)
-            break
+            return "live", bool(user.get("private_account")), str(user.get("nickname") or "")
         except Exception as e:
+            last_err = e
             log.warning("livedie probe failed for %s: %s", username, e)
+            if _is_not_found_error(e):
+                return "die", False, ""
             await asyncio.sleep(1)
-    if not user:
-        return False, False, ""
-    return True, bool(user.get("private_account")), str(user.get("nickname") or "")
+    return "unknown", False, ""
+
+
+# ---------- watchlist: theo dõi LIVE/DIE, báo khi đổi trạng thái ----------
+_watch_lock = threading.Lock()
+
+
+def _watch_load() -> dict:
+    try:
+        with open(WATCH_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _watch_save(data: dict):
+    tmp = WATCH_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, WATCH_FILE)
+
+
+def _watch_now() -> str:
+    return datetime.now(tz=VN_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _watch_upsert(username: str, status: str, nickname: str, chat_id: int):
+    with _watch_lock:
+        data = _watch_load()
+        key = username.lower()
+        entry = data.get(key, {})
+        entry.update(
+            {
+                "username": username,
+                "status": status,
+                "nickname": nickname or entry.get("nickname", ""),
+                "last_checked": _watch_now(),
+                "chat_id": chat_id,
+            }
+        )
+        data[key] = entry
+        _watch_save(data)
+
+
+def _status_tag(status: str, is_private: bool = False) -> str:
+    if status == "live":
+        return "🔒 LIVE (riêng tư)" if is_private else "✅ LIVE"
+    if status == "die":
+        return "❌ DIE"
+    return "❓ CHƯA CHẮC"
+
+
+async def _notify_status_change(bot, entry: dict, old: str, new: str, nickname: str):
+    username = entry["username"]
+    chat_id = entry.get("chat_id")
+    if not chat_id:
+        return
+    nick = f" ({html.escape(nickname)})" if nickname else ""
+    try:
+        if new == "live":
+            head = (
+                f"🟢 <b>@{html.escape(username)}</b>{nick} vừa <b>LIVE</b> trở lại "
+                f"(trước đó: {_status_tag(old)})!\n\n"
+            )
+            try:
+                user = await fetch_tiktok_user(username)
+                text, kb = build_report(username, user)
+                await bot.send_message(
+                    chat_id, head + text, parse_mode=ParseMode.HTML, reply_markup=kb
+                )
+            except Exception:
+                await bot.send_message(chat_id, head.rstrip(), parse_mode=ParseMode.HTML)
+        else:
+            await bot.send_message(
+                chat_id,
+                f"🔴 <b>@{html.escape(username)}</b>{nick} vừa <b>DIE</b> "
+                f"(trước đó: {_status_tag(old)}) — tài khoản không còn truy cập được.",
+                parse_mode=ParseMode.HTML,
+            )
+    except Exception as e:
+        log.warning("watch notify failed for %s: %s", username, e)
+
+
+async def _watch_check_once(app):
+    """Quét toàn bộ watchlist 1 lượt; chỉ báo khi trạng thái đổi LIVE<->DIE."""
+    with _watch_lock:
+        data = _watch_load()
+    if not data:
+        return
+    changed = False
+    for i, (key, entry) in enumerate(list(data.items())):
+        username = entry.get("username") or key
+        old = entry.get("status", "unknown")
+        status, is_private, nickname = await probe_live(username)
+        entry["last_checked"] = _watch_now()
+        if nickname:
+            entry["nickname"] = nickname
+        changed = True
+        if status in ("live", "die") and old in ("live", "die") and status != old:
+            entry["status"] = status
+            await _notify_status_change(app.bot, entry, old, status, nickname)
+        elif status in ("live", "die"):
+            entry["status"] = status
+        # status == "unknown": giữ nguyên trạng thái cũ, không báo
+        if i < len(data) - 1:
+            await asyncio.sleep(WATCH_GAP_SEC)
+    if changed:
+        with _watch_lock:
+            _watch_save(data)
+
+
+async def _watch_job(context: ContextTypes.DEFAULT_TYPE):
+    await _watch_check_once(context.application)
+
+
+async def _watch_loop(app):
+    while True:
+        await asyncio.sleep(WATCH_INTERVAL_SEC)
+        try:
+            await _watch_check_once(app)
+        except Exception as e:
+            log.warning("watch loop error: %s", e)
+
+
+async def _post_init(app):
+    if app.job_queue is not None:
+        app.job_queue.run_repeating(
+            _watch_job, interval=WATCH_INTERVAL_SEC, first=WATCH_INTERVAL_SEC
+        )
+        log.info("Watchlist job queue started, interval=%ss", WATCH_INTERVAL_SEC)
+    else:
+        asyncio.create_task(_watch_loop(app))
+        log.info("Watchlist asyncio loop started, interval=%ss", WATCH_INTERVAL_SEC)
+
+
+async def cmd_checklive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check LIVE/DIE 1 lần + tự thêm vào watchlist để báo khi đổi trạng thái.
+    LIVE -> trả báo cáo đầy đủ; DIE -> báo DIE. Cả 2 đều được theo dõi."""
+    usernames = parse_usernames(" ".join(context.args))
+    if not usernames:
+        await update.message.reply_text(
+            "Dùng: /checklive @user — check LIVE/DIE ngay và tự theo dõi, "
+            "đổi trạng thái là bot báo. Bỏ theo dõi: /unwatch @user"
+        )
+        return
+    chat_id = update.effective_chat.id
+    for i, u in enumerate(usernames):
+        status, is_private, nickname = await probe_live(u)
+        _watch_upsert(u, status, nickname, chat_id)
+        if status == "live":
+            try:
+                user = await fetch_tiktok_user(u)
+                text, kb = build_report(u, user)
+                await update.message.reply_text(
+                    text
+                    + "\n\n👁️ <i>Đã đưa vào danh sách theo dõi — đổi trạng thái là báo ngay.</i>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb,
+                )
+            except Exception:
+                await update.message.reply_text(
+                    f"✅ <b>LIVE</b> — @{html.escape(u)} (chưa lấy được báo cáo chi tiết, thử /check sau)\n"
+                    "👁️ Đã đưa vào danh sách theo dõi.",
+                    parse_mode=ParseMode.HTML,
+                )
+        elif status == "die":
+            await update.message.reply_text(
+                f"❌ <b>DIE</b> — @{html.escape(u)} không tồn tại (đã bị khóa / đã xóa / sai username).\n"
+                "👁️ Đã đưa vào danh sách theo dõi — nếu acc LIVE trở lại bot sẽ báo kèm thông tin kênh.",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await update.message.reply_text(
+                f"❓ <b>CHƯA CHẮC</b> — @{html.escape(u)} lỗi tạm thời, chưa kết luận được.\n"
+                "👁️ Đã đưa vào danh sách theo dõi, bot sẽ check lại định kỳ.",
+                parse_mode=ParseMode.HTML,
+            )
+        if i < len(usernames) - 1:
+            await asyncio.sleep(0.6)
+
+
+async def cmd_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    usernames = parse_usernames(" ".join(context.args))
+    if not usernames:
+        await update.message.reply_text(
+            "Dùng: /watch @user1 @user2 ... — bot sẽ theo dõi và báo ngay khi acc đổi LIVE/DIE."
+        )
+        return
+    chat_id = update.effective_chat.id
+    lines = []
+    for i, u in enumerate(usernames):
+        status, is_private, nickname = await probe_live(u)
+        _watch_upsert(u, status, nickname, chat_id)
+        nick = f" ({html.escape(nickname)})" if nickname else ""
+        lines.append(f"👁️ Đang theo dõi @{html.escape(u)}{nick} — hiện tại: {_status_tag(status, is_private)}")
+        if i < len(usernames) - 1:
+            await asyncio.sleep(0.6)
+    await update.message.reply_text(
+        "\n".join(lines)
+        + f"\n\nBot check lại mỗi {WATCH_INTERVAL_SEC // 60} phút, đổi trạng thái là báo ngay. "
+        "Bỏ theo dõi: /unwatch @user · Xem danh sách: /watchlist",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def cmd_unwatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    usernames = parse_usernames(" ".join(context.args))
+    if not usernames:
+        await update.message.reply_text("Dùng: /unwatch @user1 @user2 ...")
+        return
+    removed, missing = [], []
+    with _watch_lock:
+        data = _watch_load()
+        for u in usernames:
+            if data.pop(u.lower(), None) is not None:
+                removed.append(u)
+            else:
+                missing.append(u)
+        _watch_save(data)
+    lines = []
+    if removed:
+        lines.append("🗑️ Đã bỏ theo dõi: " + ", ".join(f"@{html.escape(u)}" for u in removed))
+    if missing:
+        lines.append("ℹ️ Không có trong danh sách: " + ", ".join(f"@{html.escape(u)}" for u in missing))
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def cmd_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with _watch_lock:
+        data = _watch_load()
+    if not data:
+        await update.message.reply_text(
+            "📋 Chưa theo dõi acc nào. Thêm bằng: /watch @user"
+        )
+        return
+    lines = [f"📋 <b>DANH SÁCH THEO DÕI</b> ({len(data)} acc)"]
+    for entry in sorted(data.values(), key=lambda e: e.get("username", "").lower()):
+        nick = f" ({html.escape(entry['nickname'])})" if entry.get("nickname") else ""
+        lines.append(
+            f"{_status_tag(entry.get('status', 'unknown'))} — @{html.escape(entry.get('username', '?'))}{nick}"
+            f" · check cuối: {html.escape(str(entry.get('last_checked', '?')))}"
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 async def cmd_livedie(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -382,15 +655,19 @@ async def cmd_livedie(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⏳ Đang check {len(usernames)} acc, sếp chờ xíu..."
     )
     lines = []
-    n_live = 0
+    n_live = n_die = n_unknown = 0
     for i, u in enumerate(usernames, 1):
-        is_live, is_private, nickname = await probe_live(u)
+        status, is_private, nickname = await probe_live(u)
         nick = f" ({html.escape(nickname)})" if nickname else ""
-        if is_live:
+        if status == "live":
             n_live += 1
             tag = "🔒 LIVE (riêng tư)" if is_private else "✅ LIVE"
-        else:
+        elif status == "die":
+            n_die += 1
             tag = "❌ DIE"
+        else:
+            n_unknown += 1
+            tag = "❓ CHƯA CHẮC (lỗi tạm thời, thử lại sau)"
         lines.append(f"{tag} — @{html.escape(u)}{nick}")
         if i < len(usernames):
             await asyncio.sleep(0.6)
@@ -399,10 +676,10 @@ async def cmd_livedie(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await status_msg.edit_text(f"⏳ Đang check {i}/{len(usernames)} acc...")
                 except Exception:
                     pass
-    n_die = len(usernames) - n_live
     text = (
         f"⚡ <b>KẾT QUẢ LIVE/DIE</b> ({len(usernames)} acc)\n"
-        f"✅ LIVE: <b>{n_live}</b> · ❌ DIE: <b>{n_die}</b>\n\n" + "\n".join(lines)
+        f"✅ LIVE: <b>{n_live}</b> · ❌ DIE: <b>{n_die}</b> · ❓ CHƯA CHẮC: <b>{n_unknown}</b>\n\n"
+        + "\n".join(lines)
     )
     await status_msg.edit_text(text, parse_mode=ParseMode.HTML)
 
@@ -471,14 +748,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     if not BOT_TOKEN:
         raise SystemExit("Thiếu BOT_TOKEN — set biến môi trường BOT_TOKEN rồi chạy lại.")
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(_post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler(["check", "id"], cmd_check))
     app.add_handler(CommandHandler("livedie", cmd_livedie))
+    app.add_handler(CommandHandler("checklive", cmd_checklive))
+    app.add_handler(CommandHandler("watch", cmd_watch))
+    app.add_handler(CommandHandler("unwatch", cmd_unwatch))
+    app.add_handler(CommandHandler("watchlist", cmd_watchlist))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     _start_health_server()
-    log.info("bot version: v2.1-livedie (them lenh /livedie check LIVE/DIE)")
+    log.info("bot version: v2.3-watchlist (/livedie 3-state + /watch /unwatch /watchlist, bao khi doi LIVE/DIE)")
     log.info("Bot đang chạy, chờ tin nhắn...")
     app.run_polling()
 
