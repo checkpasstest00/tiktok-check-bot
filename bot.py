@@ -20,7 +20,7 @@ from zoneinfo import ZoneInfo
 from urllib.parse import urlparse
 
 import httpx
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder,
@@ -53,6 +53,34 @@ USER_AGENT = (
 
 COOLDOWN_SEC = 5
 _last_check: dict = {}
+
+# --- menu lệnh (hiện khi gõ "/" trong Telegram) ---
+BOT_COMMANDS = [
+    BotCommand("check", "Xem thông tin chi tiết 1 kênh TikTok"),
+    BotCommand("checklive", "Check LIVE/DIE ngay + tự theo dõi, đổi trạng thái là báo"),
+    BotCommand("livedie", "Check nhiều acc LIVE hay DIE (tối đa 20)"),
+    BotCommand("watch", "Thêm acc vào danh sách theo dõi LIVE/DIE"),
+    BotCommand("unwatch", "Bỏ theo dõi acc"),
+    BotCommand("watchlist", "Xem danh sách acc đang theo dõi"),
+    BotCommand("help", "Xem danh sách lệnh và cách dùng"),
+]
+
+HELP_TEXT = (
+    "📋 <b>Các lệnh của bot:</b>\n\n"
+    "/check &lt;username&gt; — xem báo cáo chi tiết 1 kênh (LIVE ra đủ thông tin, DIE báo DIE)\n"
+    "vd: /check phucduynguyen497\n\n"
+    "/checklive &lt;user&gt; — check LIVE/DIE ngay (LIVE ra đủ thông tin) + tự theo dõi, "
+    "đổi trạng thái là bot báo\n"
+    "vd: /checklive @tiktok\n\n"
+    "/livedie &lt;user1&gt; &lt;user2&gt;... — check nhiều acc LIVE hay DIE cùng lúc (tối đa 20)\n"
+    "vd: /livedie user1 user2 user3\n\n"
+    "/watch &lt;user1&gt; &lt;user2&gt;... — thêm acc vào danh sách theo dõi, đổi trạng thái LIVE/DIE là báo ngay\n"
+    "/unwatch &lt;user1&gt;... — bỏ theo dõi\n"
+    "/watchlist — xem danh sách đang theo dõi\n"
+    "/help — xem lại danh sách lệnh này\n\n"
+    "💡 Không cần lệnh cũng được: cứ gửi thẳng <b>username</b> hoặc <b>link TikTok</b> "
+    "là bot check luôn."
+)
 
 URL_RE = re.compile(r"https?://[^\s)>\]]+", re.I)
 TIKTOK_URL_RE = re.compile(
@@ -303,17 +331,15 @@ def _start_health_server():
 
 
 # ---------- handlers ----------
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML)
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Chào sếp! Gửi cho tôi <b>username</b> hoặc <b>link TikTok</b> "
         "(vd: @phucduynguyen497 hoặc https://www.tiktok.com/@phucduynguyen497) "
-        "để check thông tin kênh.\n\nLệnh:\n"
-        "/check &lt;username&gt; — xem báo cáo chi tiết (LIVE thì ra đủ thông tin, DIE thì báo DIE)\n"
-        "/livedie &lt;user1&gt; &lt;user2&gt;... — check acc LIVE hay DIE (tối đa 20 acc/lần)\n"
-        "/checklive &lt;user&gt; — check LIVE/DIE ngay (LIVE ra đủ thông tin) + tự theo dõi, đổi trạng thái là báo\n"
-        "/watch &lt;user1&gt; &lt;user2&gt;... — theo dõi acc, đổi trạng thái LIVE/DIE là bot báo ngay\n"
-        "/unwatch &lt;user1&gt;... — bỏ theo dõi\n"
-        "/watchlist — xem danh sách đang theo dõi",
+        "để check thông tin kênh.\n\n" + HELP_TEXT,
         parse_mode=ParseMode.HTML,
     )
 
@@ -517,6 +543,11 @@ async def _watch_loop(app):
 
 
 async def _post_init(app):
+    try:
+        await app.bot.set_my_commands(BOT_COMMANDS)
+        log.info("Da dang ky menu lenh (%d lenh)", len(BOT_COMMANDS))
+    except Exception as e:
+        log.warning("set_my_commands failed: %s", e)
     if app.job_queue is not None:
         app.job_queue.run_repeating(
             _watch_job, interval=WATCH_INTERVAL_SEC, first=WATCH_INTERVAL_SEC
@@ -750,6 +781,7 @@ def main():
         raise SystemExit("Thiếu BOT_TOKEN — set biến môi trường BOT_TOKEN rồi chạy lại.")
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(_post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler(["check", "id"], cmd_check))
     app.add_handler(CommandHandler("livedie", cmd_livedie))
     app.add_handler(CommandHandler("checklive", cmd_checklive))
@@ -759,7 +791,7 @@ def main():
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     _start_health_server()
-    log.info("bot version: v2.3-watchlist (/livedie 3-state + /watch /unwatch /watchlist, bao khi doi LIVE/DIE)")
+    log.info("bot version: v2.4-commands (menu lenh + /help + watchlist LIVE/DIE)")
     log.info("Bot đang chạy, chờ tin nhắn...")
     app.run_polling()
 
